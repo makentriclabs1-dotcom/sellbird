@@ -1,5 +1,6 @@
 """Tests for the free PROFILE collector and the observation model."""
 
+import asyncio
 import os
 from contextlib import closing
 import tempfile
@@ -289,3 +290,151 @@ async def test_profile_uses_homepage_brand_over_service_location_title(
         await c.run([{"id": cid, "name": current, "domain": domain}])
     assert (await state.get_company_by_domain(domain)).name == brand
     assert (await state.get_prospect(pid)).company == brand
+
+
+@pytest.mark.asyncio
+async def test_run_persists_partial_observations_when_company_times_out(state):
+    """A timeout must not discard signals collected before cancellation."""
+    # ProfileCollector.run() is tested directly, so seed the governed signal
+    # vocabulary that the normal profile_companies() entry point seeds.
+    await seed_signal_catalog(state)
+    cid = await state.add_company(Company(name="Slow Plumbing", domain="slow.example"))
+    c = ProfileCollector(state, {"TECH_STACK"}, timeout=0.03)
+
+    async def collect_then_stall(company_id, domain, observations=None):
+        observations.append({
+            "signal_code": "TECH_STACK",
+            "company_id": company_id,
+            "collector": "profile",
+            "value_num": None,
+            "value_text": "WordPress",
+            "confidence": 1.0,
+            "evidence_url": "https://slow.example/",
+        })
+        await asyncio.sleep(1)
+
+    c.profile_company = collect_then_stall
+    async with c:
+        saved = await c.run([{"id": cid, "name": "Slow Plumbing", "domain": "slow.example"}])
+
+    rows = await state.get_observations(company_id=cid, signal_code="TECH_STACK")
+    assert saved == 1
+    assert len(rows) == 1
+    assert rows[0]["value_text"] == "WordPress"
+
+
+@pytest.mark.asyncio
+async def test_get_uses_remaining_company_deadline_as_request_timeout():
+    class SlowClient:
+        async def get(self, url):
+            await asyncio.sleep(1)
+            raise AssertionError("request should have been cancelled first")
+
+    c = ProfileCollector(state=None, confirmed=set(), timeout=1)
+    c._client = SlowClient()
+    c._deadline = asyncio.get_running_loop().time() + 0.03
+
+    started = asyncio.get_running_loop().time()
+    result = await c._get("https://example.com/slow")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result == ""
+    assert elapsed < 0.25
+
+
+@pytest.mark.asyncio
+async def test_candidate_search_shares_company_deadline_across_paths():
+    c = ProfileCollector(state=None, confirmed=set(), timeout=1)
+    c._deadline = asyncio.get_running_loop().time() + 0.04
+    calls = []
+
+    async def slow_get(url):
+        calls.append(url)
+        await asyncio.sleep(1)
+        return ""
+
+    c._get = slow_get
+    started = asyncio.get_running_loop().time()
+    result = await c._first_present("https://example.com", ("/one", "/two", "/three"))
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result == ("", "")
+    assert len(calls) == 1
+    assert elapsed < 0.25
+
+
+@pytest.mark.asyncio
+async def test_get_skips_host_after_confirmed_challenge():
+    class CountingClient:
+        def __init__(self):
+            self.calls = 0
+        async def get(self, url):
+            self.calls += 1
+            raise AssertionError("a challenged host must not be requested again")
+
+    c = ProfileCollector(state=None, confirmed=set())
+    c._client = CountingClient()
+    c.challenged.add("blocked.example")
+
+    assert await c._get("https://www.blocked.example/contact") == ""
+    assert c._client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_continues_to_next_company_after_timeout(state, monkeypatch):
+    # Direct collector tests must seed the observation vocabulary themselves.
+    await seed_signal_catalog(state)
+    first = await state.add_company(Company(name="Slow One", domain="slow-one.example"))
+    second = await state.add_company(Company(name="Fast Two", domain="fast-two.example"))
+    c = ProfileCollector(state, {"TECH_STACK"}, timeout=0.03)
+    real_sleep = asyncio.sleep
+
+    async def collect(company_id, domain, observations=None):
+        observations.append({
+            "signal_code": "TECH_STACK",
+            "company_id": company_id,
+            "collector": "profile",
+            "value_text": "WordPress",
+            "confidence": 1.0,
+            "evidence_url": f"https://{domain}/",
+        })
+        if domain == "slow-one.example":
+            await real_sleep(1)
+
+    c.profile_company = collect
+    monkeypatch.setattr("sellbird.collectors.profile.random.uniform", lambda *_: 0)
+    async with c:
+        saved = await c.run([
+            {"id": first, "name": "Slow One", "domain": "slow-one.example"},
+            {"id": second, "name": "Fast Two", "domain": "fast-two.example"},
+        ])
+
+    rows = await state.get_observations(signal_code="TECH_STACK")
+    assert saved == 2
+    assert {row["company_id"] for row in rows} == {first, second}
+
+
+@pytest.mark.asyncio
+async def test_get_blocks_host_after_plain_429_response():
+    class RateLimitedResponse:
+        status_code = 429
+        text = "Too many requests"
+        url = "https://www.limited.example/contact"
+        headers = {"content-type": "text/html"}
+
+    class CountingClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url):
+            self.calls += 1
+            return RateLimitedResponse()
+
+    c = ProfileCollector(state=None, confirmed=set())
+    c._client = CountingClient()
+
+    assert await c._get("https://limited.example/") == ""
+    assert "limited.example" in c.challenged
+
+    assert await c._get("https://www.limited.example/contact") == ""
+    assert c._client.calls == 1

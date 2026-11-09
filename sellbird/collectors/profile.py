@@ -30,7 +30,7 @@ from sellbird.collectors.discover import (
 
 logger = logging.getLogger("sellbird.collectors.profile")
 
-TIMEOUT = httpx.Timeout(connect=8.0, read=12.0, write=8.0, pool=8.0)
+TIMEOUT = httpx.Timeout(connect=5.0, read=7.0, write=5.0, pool=5.0)
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -804,7 +804,7 @@ class ProfileCollector:
     even if the data is sitting right there in the HTML.
     """
 
-    def __init__(self, state, confirmed: set[str] | None = None, timeout: float = 12.0,
+    def __init__(self, state, confirmed: set[str] | None = None, timeout: float = 45.0,
                  role_keywords: list[str] | None = None):
         self.state = state
         self.confirmed = confirmed if confirmed is not None else set()
@@ -812,6 +812,7 @@ class ProfileCollector:
         # icp.hiring_signals (or icp.titles): which open roles are worth a row.
         self.role_keywords = list(role_keywords or [])
         self._client: httpx.AsyncClient | None = None
+        self._deadline: float | None = None
         self.site_names: dict[str, str] = {}
         # Hosts that answered with a bot challenge (SiteGround's 202,
         # Cloudflare's "Just a moment...") rather than a page.
@@ -819,6 +820,13 @@ class ProfileCollector:
 
     def wants(self, code: str) -> bool:
         return code in self.confirmed
+
+    def _remaining_budget(self) -> float | None:
+        """Seconds left in the current company's shared profiling budget."""
+        deadline = getattr(self, "_deadline", None)
+        if deadline is None:
+            return None
+        return max(0.0, deadline - asyncio.get_running_loop().time())
 
     async def __aenter__(self):
         self._client = public_http_client(
@@ -833,14 +841,42 @@ class ProfileCollector:
             await self._client.aclose()
 
     async def _get(self, url: str) -> str:
-        try:
-            resp = await self._client.get(url)
-        except (httpx.HTTPError, ValueError) as e:
-            logger.debug(f"fetch failed {url}: {e}")
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        if host and host in getattr(self, "challenged", set()):
+            logger.debug("profile: skipping further requests to challenged host %s", host)
             return ""
-        if resp.status_code in (200, 202, 403, 429, 503) and looks_like_challenge(
-                resp.text or "", resp.status_code):
-            self.challenged.add(urlparse(url).netloc.lower().removeprefix("www."))
+
+        remaining = self._remaining_budget()
+        if remaining is not None and remaining <= 0:
+            logger.debug("profile: company time budget exhausted before %s", url)
+            return ""
+        request_timeout = 8.0 if remaining is None else min(8.0, remaining)
+
+        try:
+            # AsyncClient.get() reads the complete body before returning. The
+            # outer wait_for therefore bounds DNS/connect, redirects, headers,
+            # and slow-dripped response bodies as one operation.
+            resp = await asyncio.wait_for(
+                self._client.get(url), timeout=request_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("profile: request timed out; skipping %s", url)
+            return ""
+        except (httpx.HTTPError, ValueError) as e:
+            logger.debug("profile: fetch failed %s: %s", url, e)
+            return ""
+
+        if resp.status_code == 429 or (
+                resp.status_code in (200, 202, 403, 503)
+                and looks_like_challenge(resp.text or "", resp.status_code)
+        ):
+            # Remember both the requested host and the final redirect host.
+            # Later optional probes should not keep hitting a challenged site.
+            for challenged_url in (url, str(getattr(resp, "url", url))):
+                challenged_host = (urlparse(challenged_url).hostname or "").lower()
+                challenged_host = challenged_host.removeprefix("www.")
+                if challenged_host:
+                    self.challenged.add(challenged_host)
             return ""
         if resp.status_code != 200:
             return ""
@@ -868,10 +904,26 @@ class ProfileCollector:
         return "", ""
 
     async def _first_present(self, site: str, paths) -> tuple[str, str]:
-        """Return (url, html) for the first path that returns content."""
+        """Return the first available page within local and company budgets."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 12.0
+        company_deadline = getattr(self, "_deadline", None)
+        if company_deadline is not None:
+            deadline = min(deadline, company_deadline)
+
         for path in paths:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.debug("profile: candidate-page budget exhausted for %s", site)
+                break
             url = f"{site}{path}"
-            html = await self._get(url)
+            try:
+                html = await asyncio.wait_for(
+                    self._get(url), timeout=min(8.0, remaining)
+                )
+            except asyncio.TimeoutError:
+                logger.warning("profile: candidate page timed out; skipping %s", url)
+                continue
             if html and len(html) > 500:
                 return url, html
         return "", ""
@@ -904,7 +956,17 @@ class ProfileCollector:
         if board is None:
             curl, chtml = await self._careers_page(site, home, domain)
             board = detect_board(chtml, domain)
-        postings = await read_board(self._client, board) if board else None
+        postings = None
+        if board:
+            remaining = self._remaining_budget()
+            board_timeout = 8.0 if remaining is None else min(8.0, remaining)
+            if board_timeout > 0:
+                try:
+                    postings = await asyncio.wait_for(
+                        read_board(self._client, board), timeout=board_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("profile: job-board request timed out; skipping %s", board.label)
         if postings is not None:
             add("OPEN_ROLES", num=len(postings), text=board.label, url=board.page_url)
             keywords = getattr(self, "role_keywords", None) or []
@@ -1085,9 +1147,15 @@ class ProfileCollector:
 
     # ── the stage itself ──
 
-    async def profile_company(self, company_id: str, domain: str) -> list[dict]:
-        """Collect every confirmed profile signal for one business."""
-        obs: list[dict] = []
+    async def profile_company(
+        self, company_id: str, domain: str, observations: list[dict] | None = None,
+    ) -> list[dict]:
+        """Collect confirmed signals, appending to a caller-owned partial-result list.
+
+        The caller owns the list so observations already discovered remain
+        available even if the per-company task is cancelled at its deadline.
+        """
+        obs: list[dict] = observations if observations is not None else []
         domain = domain.lower().replace("www.", "").strip("/")
         if any(domain == d or domain.endswith("." + d) for d in YC_OWNED_DOMAINS):
             # YC's own sites forbid scraping; they're never a prospect anyway.
@@ -1101,7 +1169,6 @@ class ProfileCollector:
                 "value_num": num, "value_text": text, "confidence": conf,
                 "evidence_url": url or site,
             })
-
         site, home = await self._resolve_site(domain)
         if not home:
             # A failure IS an observation — silent failures look like clean results.
@@ -1284,32 +1351,90 @@ class ProfileCollector:
             logger.debug(f"mark_company_profiled failed for {company_id}: {e}")
 
     async def run(self, companies: list[dict], run_id: str = "") -> int:
-        """Profile many businesses, flushing observations after each one.
+        """Profile companies sequentially under one deadline each.
 
-        Flush-per-item is deliberate: the observations are the asset, and a
-        long run that dies must not take them with it.
+        Observations are collected into a list owned by this method. If a
+        company's task times out or fails, that partial list is still flushed
+        before moving to the next company.
         """
         total = 0
-        for company in companies:
+        company_count = len(companies)
+        loop = asyncio.get_running_loop()
+
+        for index, company in enumerate(companies, 1):
             domain = (company.get("domain") or "").strip()
-            if not domain:
+            company_id = company.get("id")
+
+            if not domain or not company_id:
+                logger.info(
+                    "profile: [%s/%s] skipping company with no domain or ID",
+                    index, company_count,
+                )
                 continue
+
+            logger.info(
+                "profile: [%s/%s] checking %s (time limit: %.0fs)",
+                index, company_count, domain, self.timeout,
+            )
+
+            # The exact same absolute deadline is observed by every helper and
+            # request below; nested page searches cannot restart the clock.
+            observations: list[dict] = []
+            self._deadline = loop.time() + max(0.0, self.timeout)
+            outcome = "completed"
             try:
-                obs = await self.profile_company(company["id"], domain)
+                async with asyncio.timeout_at(self._deadline):
+                    await self.profile_company(company_id, domain, observations)
+            except TimeoutError:
+                outcome = "timed out"
+                logger.warning(
+                    "profile: %s reached its %.0f-second deadline; preserving partial results",
+                    domain, self.timeout,
+                )
             except Exception as e:
-                logger.warning(f"profile failed for {domain}: {e}")
-                await self._mark_checked(company["id"])
-                continue
-            # Marked regardless of outcome — an unreachable site still counts
-            # as checked, or the same handful gets retried every cycle
-            # forever instead of rotating through the rest of the backlog.
-            await self._mark_checked(company["id"])
+                outcome = "failed"
+                logger.warning("profile failed for %s: %s", domain, e)
+            finally:
+                # Do not let one company's deadline leak into the next company.
+                self._deadline = None
+
+            # Save observations regardless of completion, timeout, or a later
+            # optional-check failure. Saving is deliberately outside the timed
+            # task so cancellation cannot interrupt the database flush.
+            observations_saved = True
+            if observations:
+                try:
+                    saved = await self.state.add_observations(observations, run_id=run_id)
+                    total += saved
+                    if outcome == "completed":
+                        logger.info("profile: %s -> %s observation(s)", domain, len(observations))
+                    else:
+                        logger.info("profile: %s -> saved %s partial observation(s)", domain, saved)
+                except Exception:
+                    observations_saved = False
+                    logger.exception("profile: could not save observations for %s", domain)
+
+            # Preserve the existing rotation policy unless persistence failed.
+            # A failed database flush must remain eligible for another attempt.
+            if observations_saved:
+                await self._mark_checked(company_id)
+            else:
+                logger.warning("profile: %s left pending because its observations were not saved", domain)
             await self._improve_name(company, domain)
-            if obs:
-                total += await self.state.add_observations(obs, run_id=run_id)
-                logger.info(f"profile: {domain} → {len(obs)} observation(s)")
+
+            if outcome != "completed":
+                continue
+            if not observations:
+                logger.info("profile: %s -> no confirmed signals found", domain)
+
             await asyncio.sleep(random.uniform(0.4, 1.2))
+
+        logger.info(
+            "profile: finished %s site(s); saved %s observation(s)",
+            company_count, total,
+        )
         return total
+
 
 
 async def profile_companies(state, companies: list[dict], config=None) -> tuple[int, str]:
@@ -1338,4 +1463,3 @@ async def profile_companies(state, companies: list[dict], config=None) -> tuple[
     except Exception as e:
         await state.finish_run(run_id, status="failed", error=str(e))
         raise
-
