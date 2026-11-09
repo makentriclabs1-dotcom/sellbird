@@ -1105,6 +1105,8 @@ def cmd_suppressions(args):
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO)
     from sellbird.textio import utf8_stdio
     utf8_stdio()
     from sellbird.paths import PROJECT_ROOT
@@ -1366,3 +1368,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

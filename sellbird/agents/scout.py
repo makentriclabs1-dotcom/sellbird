@@ -1570,28 +1570,28 @@ Respond ONLY with the JSON array."""
                 logger.debug(f"save_email_pattern failed: {e}")
 
     async def _known_small(self, domain: str) -> bool:
-        """Is there a size signal independent of the website? The ICP's
-        company size, the company's size on file, or a local-business
-        listing (OpenStreetMap, DataForSEO Business Listings) as its source.
-        Three executives on a homepage say nothing about headcount."""
+        """Return True only when the company's own stored size indicates
+        20 or fewer employees. ICP preferences and directory sources are
+        not evidence of an individual company's headcount.
+        """
         def upper(text: str) -> int | None:
-            nums = [int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", text or "")]
+            nums = [
+                int(n.replace(",", ""))
+                for n in re.findall(r"\d[\d,]*", text or "")
+            ]
             return max(nums) if nums else None
 
-        icp = getattr(getattr(self, "config", None), "icp", None)
-        bound = upper(getattr(icp, "company_size", "") or "")
-        if bound is not None and bound <= SMALL_COMPANY_MAX:
-            return True
         try:
             company = await self.state.get_company_by_domain(domain)
         except Exception:
             company = None
+
         if company is None:
             return False
+
         size = upper(getattr(company, "company_size", "") or "")
-        if size is not None and size <= SMALL_COMPANY_MAX:
-            return True
-        return (getattr(company, "source", "") or "") in LOCAL_BUSINESS_SOURCES
+        return size is not None and size <= SMALL_COMPANY_MAX
+       
 
     def _people_from_cards(self, pages: list[tuple[str, str]]) -> list[dict]:
         """Fallback: CSS-class team cards (first heading = name). Only names

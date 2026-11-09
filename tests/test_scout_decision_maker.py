@@ -323,16 +323,16 @@ async def test_no_size_signal_keeps_the_first_last_default(no_network):
 
 
 @pytest.mark.asyncio
-async def test_a_small_icp_allows_the_first_name_default(no_network):
+async def test_a_small_icp_does_not_prove_company_size(no_network):
     pages = {"https://acme.com": "<h3>John Doe</h3><p>Owner</p>"}
     scout = site_scout(pages)
     scout.config.icp.company_size = "1-10 employees"
     [p, *_] = await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing")
-    assert p.email == "john@acme.com"
+    assert p.email == "john.doe@acme.com"
 
 
 @pytest.mark.asyncio
-async def test_a_local_business_listing_allows_the_first_name_default(no_network):
+async def test_a_local_business_listing_does_not_prove_company_size(no_network):
     pages = {"https://acme.com": "<h3>John Doe</h3><p>Owner</p>"}
     scout = site_scout(pages)
 
@@ -341,7 +341,7 @@ async def test_a_local_business_listing_allows_the_first_name_default(no_network
 
     scout.state.get_company_by_domain = company
     [p, *_] = await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing")
-    assert p.email == "john@acme.com"
+    assert p.email == "john.doe@acme.com"
 
 
 @pytest.mark.asyncio
@@ -427,3 +427,54 @@ async def test_scout_search_web_uses_tinyfish_backend():
     assert called == [("tinyfish", "Denver roofers", "tf_key")]
     assert len(results) == 1
     assert results[0][0] == "https://summit.example"
+
+
+@pytest.mark.asyncio
+async def test_known_small_does_not_use_icp_as_company_evidence():
+    scout = site_scout({})
+    scout.config.icp.company_size = "1-20 employees"
+
+    async def get_company(domain):
+        return None
+
+    scout.state.get_company_by_domain = get_company
+
+    assert await scout._known_small("example.com") is False
+
+
+@pytest.mark.asyncio
+async def test_known_small_uses_company_size_on_record():
+    from sellbird.models.company import Company
+
+    scout = site_scout({})
+
+    async def get_company(domain):
+        return Company(
+            name="Example Plumbing",
+            domain=domain,
+            company_size="15 employees",
+            source="discover:osm",
+        )
+
+    scout.state.get_company_by_domain = get_company
+
+    assert await scout._known_small("example.com") is True
+
+
+@pytest.mark.asyncio
+async def test_known_small_does_not_assume_osm_listing_means_small():
+    from sellbird.models.company import Company
+
+    scout = site_scout({})
+
+    async def get_company(domain):
+        return Company(
+            name="Example Plumbing",
+            domain=domain,
+            company_size="",
+            source="discover:osm",
+        )
+
+    scout.state.get_company_by_domain = get_company
+
+    assert await scout._known_small("example.com") is False
