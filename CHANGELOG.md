@@ -9,6 +9,7 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **A company counts as small only on its own evidence.** With no published address to learn from, Scout guesses `first@` only when the company's own stored `company_size` is 20 or fewer employees, and `first.last@` otherwise. Your ICP's company size and a local-business listing (OpenStreetMap, DataForSEO) as the source no longer make a company small, since neither says anything about that company's headcount.
 - Seeding the signal catalog writes only a signal that is missing or whose catalog text changed. The dashboard seeds on every Today load, so this was a write per signal on every page view.
 - **The opt-out line takes any wording.** `compliance.opt_out_line` no longer
   has to ask for a keyword: "Not interested? Just let me know and I won't email
